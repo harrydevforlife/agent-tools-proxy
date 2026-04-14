@@ -600,7 +600,7 @@ wheels = [
 ]
 
 [[package]]
-name = "tool-call-wrapper"
+name = "agent-tools-proxy"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,4 +1,4 @@
-# Prompt engineering spec — tool-call-wrapper
+# Prompt engineering spec — agent-tools-proxy
 
 This document captures the exact prompt strategy used to teach non-function-calling
 LLMs to emit tool calls reliably. It is the contract between the wrapper and the model.

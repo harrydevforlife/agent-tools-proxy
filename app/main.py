@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Create shared HTTP client and backend adapter for the app lifetime."""
     log.info(
-        "Starting tool-call-wrapper  backend=%s  url=%s  model=%s",
+        "Starting agent-tools-proxy  backend=%s  url=%s  model=%s",
         settings.llm_backend,
         settings.llm_base_url,
         settings.llm_model,

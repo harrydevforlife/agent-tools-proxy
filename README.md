@@ -1,4 +1,4 @@
-# tool-call-wrapper
+# agent-tools-proxy
 
 A FastAPI server that gives **any non-function-calling LLM** an OpenAI-compatible
 `/v1/chat/completions` endpoint — including full SSE streaming and multi-turn

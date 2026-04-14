@@ -1,4 +1,4 @@
-# Roadmap — tool-call-wrapper
+# Roadmap — agent-tools-proxy
 
 Current status: **v0.1 — core working, Ollama backend, single tool call per turn.**
 

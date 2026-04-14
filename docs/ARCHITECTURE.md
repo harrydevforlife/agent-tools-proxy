@@ -1,4 +1,4 @@
-# Architecture — tool-call-wrapper
+# Architecture — agent-tools-proxy
 
 ## System context
 
@@ -11,7 +11,7 @@
                              │  { messages, tools[], stream: true }
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  tool-call-wrapper  (this project)                              │
+│  agent-tools-proxy  (this project)                              │
 │                                                                 │
 │  FastAPI  ·  uvicorn  ·  sse-starlette  ·  httpx               │
 └────────────────────────────┬────────────────────────────────────┘

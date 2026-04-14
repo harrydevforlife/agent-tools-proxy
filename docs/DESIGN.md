@@ -1,4 +1,4 @@
-# Design document — tool-call-wrapper
+# Design document — agent-tools-proxy
 
 ## Problem statement
 
