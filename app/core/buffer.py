@@ -6,6 +6,7 @@ State machine:
                  content tokens pass through immediately as deltas
   ACCUMULATING → opening brace seen, buffering all tokens
                  depth counter tracks nested braces
+                 braces inside JSON string literals are ignored
   DONE         → closing brace matched depth=0, buffer complete
 
 The caller receives tokens via an async generator that yields either:
@@ -28,7 +29,7 @@ class BufferState(Enum):
 
 class ToolCallDetector:
     """
-    Stateful brace-depth detector.
+    Stateful brace-depth detector with string-literal awareness.
     Feed raw text chunks; call .feed() repeatedly.
     """
 
@@ -37,9 +38,11 @@ class ToolCallDetector:
     def __init__(self, open_token: str = OPEN_TOKEN) -> None:
         self.open_token = open_token
         self._state = BufferState.SCANNING
-        self._buffer = ""        # accumulation buffer when in ACCUMULATING state
-        self._lookahead = ""     # partial prefix match buffer
-        self._depth = 0          # brace depth counter
+        self._buffer = ""
+        self._lookahead = ""
+        self._depth = 0
+        self._in_string = False
+        self._escape_next = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -60,16 +63,31 @@ class ToolCallDetector:
                 if flushed:
                     content_deltas.append(flushed)
                 if result == "matched":
-                    # open_token fully matched — switch to ACCUMULATING
                     self._state = BufferState.ACCUMULATING
                     self._buffer = self.open_token
                     self._depth = self.open_token.count("{")
                     self._lookahead = ""
-                # "pending" → still building lookahead, nothing else to emit
-                # "content" → already handled via flushed above
+                    self._in_string = False
+                    self._escape_next = False
 
             elif self._state == BufferState.ACCUMULATING:
                 self._buffer += char
+
+                if self._escape_next:
+                    self._escape_next = False
+                    continue
+
+                if char == "\\" and self._in_string:
+                    self._escape_next = True
+                    continue
+
+                if char == '"':
+                    self._in_string = not self._in_string
+                    continue
+
+                if self._in_string:
+                    continue
+
                 if char == "{":
                     self._depth += 1
                 elif char == "}":
@@ -86,6 +104,19 @@ class ToolCallDetector:
         self._lookahead = ""
         return remaining
 
+    def flush_accumulating(self) -> str:
+        """Call at stream end while ACCUMULATING — return partial buffer as content."""
+        if self._state == BufferState.ACCUMULATING:
+            remaining = self._buffer
+            self._buffer = ""
+            self._state = BufferState.DONE
+            return remaining
+        return ""
+
+    @property
+    def state(self) -> BufferState:
+        return self._state
+
     @property
     def is_done(self) -> bool:
         return self._state == BufferState.DONE
@@ -100,9 +131,6 @@ class ToolCallDetector:
             (flushed, result) where:
               flushed — content string to emit immediately (may be empty)
               result  — "matched" | "pending" | "content"
-
-        On mismatch we must emit the full candidate (lookahead + char) minus
-        whatever new tail restarts a match, so no characters are silently dropped.
         """
         candidate = self._lookahead + char
         if self.open_token.startswith(candidate):
@@ -111,16 +139,12 @@ class ToolCallDetector:
                 return "", "matched"
             return "", "pending"
         else:
-            # Mismatch — check if any tail of candidate restarts a match.
-            # Characters before the restart tail must be flushed as content.
             for start in range(1, len(candidate)):
                 tail = candidate[start:]
                 if self.open_token.startswith(tail):
-                    # emit everything before the new tail
                     flushed = candidate[:start]
                     self._lookahead = tail
                     return flushed, "pending"
-            # No restart — flush the entire candidate as content
             self._lookahead = ""
             return candidate, "content"
 
@@ -154,19 +178,12 @@ async def detect_tool_calls(
       ("content", text)
       ("tool_call", json_string)
       ("done", None)
-
-    Usage:
-        async for event_type, payload in detect_tool_calls(stream):
-            if event_type == "content":
-                # forward as SSE content delta
-            elif event_type == "tool_call":
-                # parse and emit tool_calls delta
     """
     detector = ToolCallDetector(open_token=open_token)
 
     async for chunk in token_stream:
         if detector.is_done:
-            break  # ignore tokens after a completed tool call
+            break
 
         content_deltas, tool_call_json = detector.feed(chunk)
 
@@ -176,11 +193,16 @@ async def detect_tool_calls(
 
         if tool_call_json is not None:
             yield ("tool_call", tool_call_json)
-            return  # stream ends here — client will send a new request
+            return
 
-    # Stream ended
+    # Stream ended — flush any remaining state
     remaining = detector.flush_lookahead()
-    if remaining:
+
+    if detector.state == BufferState.ACCUMULATING:
+        partial = detector.flush_accumulating()
+        if partial:
+            yield ("content", partial)
+    elif remaining:
         yield ("content", remaining)
 
     yield ("done", None)

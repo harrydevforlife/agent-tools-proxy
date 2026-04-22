@@ -95,6 +95,39 @@ class TestSerializeHistory:
         data = json.loads(result[0]["content"])
         assert data["tool_call"]["name"] == "search_products"
 
+    def test_multiple_tool_calls_all_serialized(self):
+        from app.models.openai import ToolCallMessage, ToolCallFunction
+        import json
+        tc1 = ToolCallMessage(
+            id="call_1",
+            function=ToolCallFunction(name="func_a", arguments='{"x": 1}'),
+        )
+        tc2 = ToolCallMessage(
+            id="call_2",
+            function=ToolCallFunction(name="func_b", arguments='{"y": 2}'),
+        )
+        msg = Message(role="assistant", tool_calls=[tc1, tc2])
+        result = serialize_history([msg])
+        assert len(result) == 2
+        data0 = json.loads(result[0]["content"])
+        data1 = json.loads(result[1]["content"])
+        assert data0["tool_call"]["name"] == "func_a"
+        assert data1["tool_call"]["name"] == "func_b"
+
+    def test_malformed_arguments_do_not_crash(self):
+        from app.models.openai import ToolCallMessage, ToolCallFunction
+        import json
+        tc = ToolCallMessage(
+            id="call_bad",
+            function=ToolCallFunction(name="f", arguments="not valid json{{{"),
+        )
+        msg = Message(role="assistant", tool_calls=[tc])
+        result = serialize_history([msg])
+        assert len(result) == 1
+        data = json.loads(result[0]["content"])
+        assert data["tool_call"]["name"] == "f"
+        assert data["tool_call"]["arguments"] == "not valid json{{{"
+
 
 class TestBuildLLMMessages:
     def test_no_tools_passthrough(self):
@@ -129,3 +162,22 @@ class TestBuildLLMMessages:
         result = build_llm_messages(msgs, tools=None)
         roles = [m["role"] for m in result]
         assert roles == ["user", "assistant", "user"]
+
+    def test_tool_choice_none_skips_injection(self):
+        msgs = [Message(role="user", content="hi")]
+        result = build_llm_messages(msgs, tools=[SEARCH_TOOL], tool_choice_mode="none")
+        assert len(result) == 1
+        assert "<tools>" not in result[0]["content"]
+
+    def test_tool_choice_required_adds_must_call_rule(self):
+        msgs = [Message(role="user", content="hi")]
+        result = build_llm_messages(msgs, tools=[SEARCH_TOOL], tool_choice_mode="required")
+        system = result[0]
+        assert "You MUST call" in system["content"]
+
+    def test_tool_choice_forced_adds_specific_function_rule(self):
+        msgs = [Message(role="user", content="hi")]
+        result = build_llm_messages(msgs, tools=[SEARCH_TOOL], tool_choice_mode="forced:search_products")
+        system = result[0]
+        assert "search_products" in system["content"]
+        assert "You MUST call the function" in system["content"]

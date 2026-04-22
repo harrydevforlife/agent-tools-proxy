@@ -1,6 +1,6 @@
 """Tests for app/core/buffer.py"""
 import pytest
-from app.core.buffer import ToolCallDetector, parse_tool_call, detect_tool_calls
+from app.core.buffer import BufferState, ToolCallDetector, parse_tool_call, detect_tool_calls
 
 
 class TestToolCallDetector:
@@ -131,3 +131,89 @@ class TestDetectToolCalls:
         assert "Sure! " in content
         tc_events = [e for e in events if e[0] == "tool_call"]
         assert len(tc_events) == 1
+
+    async def test_unclosed_braces_emitted_as_content(self):
+        """Stream ends mid-accumulation — partial buffer should appear as content."""
+        tokens = list('{"tool_call": {"name": "f", "arguments": {"x":')
+        events = await self._collect(tokens)
+        tc_events = [e for e in events if e[0] == "tool_call"]
+        assert len(tc_events) == 0
+        content = "".join(p for t, p in events if t == "content")
+        assert '{"tool_call"' in content
+        assert ("done", None) in events
+
+
+# ── Buffer edge case tests ────────────────────────────────────────────────────
+
+class TestBufferEdgeCases:
+    """Edge cases for ToolCallDetector: unclosed braces, string braces, large payloads."""
+
+    def _feed_all(self, text: str, chunk_size: int = 1) -> tuple[list[str], str | None]:
+        detector = ToolCallDetector()
+        all_deltas: list[str] = []
+        tool_call = None
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i:i + chunk_size]
+            deltas, tc = detector.feed(chunk)
+            all_deltas.extend(deltas)
+            if tc:
+                tool_call = tc
+        if tool_call is None:
+            remaining = detector.flush_lookahead()
+            if detector.state == BufferState.ACCUMULATING:
+                remaining += detector.flush_accumulating()
+            if remaining:
+                all_deltas.append(remaining)
+        return all_deltas, tool_call
+
+    def test_unclosed_braces_returns_partial_buffer(self):
+        """Stream ends with unclosed braces — partial buffer returned as content."""
+        text = '{"tool_call": {"name": "f", "arguments": {"x": 1'
+        deltas, tc = self._feed_all(text)
+        assert tc is None
+        combined = "".join(deltas)
+        assert '{"tool_call"' in combined
+
+    def test_braces_inside_json_string_values(self):
+        """Braces inside string values must not break depth counting."""
+        json_str = '{"tool_call": {"name": "f", "arguments": {"desc": "use { and } carefully"}}}'
+        deltas, tc = self._feed_all(json_str)
+        assert tc == json_str
+
+    def test_escaped_quotes_in_string_values(self):
+        """Escaped quotes inside strings must not toggle string state."""
+        json_str = '{"tool_call": {"name": "f", "arguments": {"msg": "say \\"hello\\" {here}"}}}'
+        deltas, tc = self._feed_all(json_str)
+        assert tc == json_str
+
+    def test_large_payload_across_many_chunks(self):
+        """Large tool call JSON split across many small chunks."""
+        import json as jsonmod
+        big_args = {f"key_{i}": f"value_{i}" for i in range(50)}
+        json_str = jsonmod.dumps({"tool_call": {"name": "big_fn", "arguments": big_args}})
+        deltas, tc = self._feed_all(json_str, chunk_size=3)
+        assert tc == json_str
+
+    def test_large_payload_char_by_char(self):
+        import json as jsonmod
+        big_args = {f"k{i}": "x" * 100 for i in range(10)}
+        json_str = jsonmod.dumps({"tool_call": {"name": "f", "arguments": big_args}})
+        deltas, tc = self._feed_all(json_str, chunk_size=1)
+        assert tc == json_str
+
+    def test_nested_objects_with_string_braces(self):
+        """Nested objects where string values contain braces at multiple levels."""
+        json_str = '{"tool_call": {"name": "f", "arguments": {"a": {"b": "text{{}}", "c": 1}}}}'
+        deltas, tc = self._feed_all(json_str)
+        assert tc == json_str
+
+    def test_empty_arguments(self):
+        json_str = '{"tool_call": {"name": "f", "arguments": {}}}'
+        deltas, tc = self._feed_all(json_str)
+        assert tc == json_str
+
+    def test_backslash_at_end_of_string_not_escaping_quote(self):
+        """A backslash that is itself escaped should not escape the following quote."""
+        json_str = '{"tool_call": {"name": "f", "arguments": {"path": "C:\\\\"}}}'
+        deltas, tc = self._feed_all(json_str)
+        assert tc == json_str

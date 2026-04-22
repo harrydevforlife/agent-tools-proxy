@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── Inbound (client → wrapper) ────────────────────────────────────────────────
@@ -37,12 +37,33 @@ class ToolChoice(BaseModel):
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None = None
-    # tool_calls present when role == "assistant" and model called a tool
+    content: str | list[Any] | None = None
     tool_calls: list[ToolCallMessage] | None = None
-    # tool_call_id + name present when role == "tool" (result message)
     tool_call_id: str | None = None
-    name: str | None = None  # function name for role="tool"
+    name: str | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _normalize_content(cls, v: Any) -> str | None:
+        """Accept both plain strings and the multimodal content-parts array
+        format ([{"type": "text", "text": "..."}]) used by some SDKs.
+        Arrays are flattened to a single string by joining text parts."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            parts: list[str] = []
+            for item in v:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(item.get("text", ""))
+                    elif "text" in item:
+                        parts.append(item["text"])
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts) if parts else ""
+        return str(v)
 
 
 class ToolCallFunction(BaseModel):
@@ -63,7 +84,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = "passthrough"
     messages: list[Message]
     tools: list[ToolDef] | None = None
-    tool_choice: Literal["none", "auto"] | ToolChoice = "auto"
+    tool_choice: Literal["none", "auto", "required"] | ToolChoice = "auto"
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None

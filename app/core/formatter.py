@@ -6,56 +6,56 @@ All public functions return **raw JSON strings** (or the "[DONE]" sentinel).
 The caller (EventSourceResponse) handles SSE ``data:`` framing — we must NOT
 add our own ``data:`` prefix here to avoid double-wrapping.
 
-OpenAI streaming protocol for tool calls:
-  1. First chunk: role="assistant", tool_calls=[{index, id, type, function.name}]
-  2. Subsequent chunks: tool_calls=[{index, function.arguments: "...partial..."}]
-  3. Final chunk: finish_reason="tool_calls"
-  4. "[DONE]" sentinel
-
-For content deltas the protocol is simpler:
-  1. First chunk: role="assistant", content=""
-  2. Subsequent chunks: content="...token..."
-  3. Final chunk: finish_reason="stop"
-  4. "[DONE]" sentinel
+Every chunk in a single stream must share the same ``id`` and ``created``
+timestamp (matching the OpenAI spec). The caller generates these once and
+passes them to all formatter calls via a StreamContext.
 """
 from __future__ import annotations
 
 import json
 import uuid
 import time
+from dataclasses import dataclass, field
 
 
-def _base_chunk(model: str = "tool-wrapper") -> dict:
+@dataclass
+class StreamContext:
+    """Immutable identifiers shared across all chunks in a single stream."""
+    chunk_id: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:12]}")
+    created: int = field(default_factory=lambda: int(time.time()))
+    model: str = "tool-wrapper"
+
+
+def _base_chunk(ctx: StreamContext) -> dict:
     return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "id": ctx.chunk_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
+        "created": ctx.created,
+        "model": ctx.model,
     }
 
 
 def _to_json(chunk: dict) -> str:
-    """Serialize a chunk dict to a JSON string (no SSE framing)."""
     return json.dumps(chunk)
 
 
-def role_chunk(model: str = "tool-wrapper") -> str:
+def role_chunk(ctx: StreamContext) -> str:
     """First chunk: establishes role=assistant."""
-    chunk = _base_chunk(model)
+    chunk = _base_chunk(ctx)
     chunk["choices"] = [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
     return _to_json(chunk)
 
 
-def content_chunk(text: str, model: str = "tool-wrapper") -> str:
+def content_chunk(text: str, ctx: StreamContext) -> str:
     """Mid-stream content delta."""
-    chunk = _base_chunk(model)
+    chunk = _base_chunk(ctx)
     chunk["choices"] = [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
     return _to_json(chunk)
 
 
-def content_stop_chunk(model: str = "tool-wrapper") -> str:
+def content_stop_chunk(ctx: StreamContext) -> str:
     """Final content chunk — signals finish_reason=stop."""
-    chunk = _base_chunk(model)
+    chunk = _base_chunk(ctx)
     chunk["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     return _to_json(chunk)
 
@@ -63,7 +63,7 @@ def content_stop_chunk(model: str = "tool-wrapper") -> str:
 def tool_call_chunks(
     name: str,
     arguments: dict,
-    model: str = "tool-wrapper",
+    ctx: StreamContext,
 ) -> list[str]:
     """
     Produce the sequence of SSE chunks for a single tool call.
@@ -74,7 +74,7 @@ def tool_call_chunks(
     tool_call_id = f"call_{uuid.uuid4().hex[:12]}"
     args_str = json.dumps(arguments, ensure_ascii=False)
 
-    c1 = _base_chunk(model)
+    c1 = _base_chunk(ctx)
     c1["choices"] = [{
         "index": 0,
         "delta": {
@@ -88,7 +88,7 @@ def tool_call_chunks(
         "finish_reason": None,
     }]
 
-    c2 = _base_chunk(model)
+    c2 = _base_chunk(ctx)
     c2["choices"] = [{
         "index": 0,
         "delta": {
@@ -100,7 +100,7 @@ def tool_call_chunks(
         "finish_reason": None,
     }]
 
-    c3 = _base_chunk(model)
+    c3 = _base_chunk(ctx)
     c3["choices"] = [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
 
     return [_to_json(c1), _to_json(c2), _to_json(c3)]

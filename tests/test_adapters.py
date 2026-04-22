@@ -8,7 +8,7 @@ import json
 import pytest
 
 from app.config import Settings
-from app.core.adapters import OllamaAdapter, OpenAIAdapter, get_adapter
+from app.core.adapters import OllamaAdapter, OpenAIAdapter, SamplingParams, get_adapter
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -28,6 +28,8 @@ MESSAGES = [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Hello"},
 ]
+
+DEFAULT_PARAMS = SamplingParams()
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
@@ -54,14 +56,34 @@ class TestOllamaAdapter:
         assert self.adapter._complete_url() == "http://localhost:11434/api/chat"
 
     def test_stream_payload_sets_stream_true(self):
-        payload = self.adapter._stream_payload(MESSAGES)
+        payload = self.adapter._stream_payload(MESSAGES, DEFAULT_PARAMS)
         assert payload["stream"] is True
         assert payload["model"] == "llama3.1"
         assert payload["messages"] == MESSAGES
 
     def test_complete_payload_sets_stream_false(self):
-        payload = self.adapter._complete_payload(MESSAGES)
+        payload = self.adapter._complete_payload(MESSAGES, DEFAULT_PARAMS)
         assert payload["stream"] is False
+
+    def test_payload_forwards_temperature(self):
+        params = SamplingParams(temperature=0.7)
+        payload = self.adapter._stream_payload(MESSAGES, params)
+        assert payload["temperature"] == 0.7
+
+    def test_payload_forwards_max_tokens_as_num_predict(self):
+        params = SamplingParams(max_tokens=100)
+        payload = self.adapter._complete_payload(MESSAGES, params)
+        assert payload["num_predict"] == 100
+
+    def test_payload_forwards_model_override(self):
+        params = SamplingParams(model="custom-model")
+        payload = self.adapter._stream_payload(MESSAGES, params)
+        assert payload["model"] == "custom-model"
+
+    def test_payload_omits_none_params(self):
+        payload = self.adapter._stream_payload(MESSAGES, DEFAULT_PARAMS)
+        assert "temperature" not in payload
+        assert "num_predict" not in payload
 
     def test_parse_stream_line_content(self):
         line = json.dumps({
@@ -130,13 +152,28 @@ class TestOpenAIAdapter:
         assert self.adapter._complete_url() == "http://localhost:8000/v1/chat/completions"
 
     def test_stream_payload(self):
-        payload = self.adapter._stream_payload(MESSAGES)
+        payload = self.adapter._stream_payload(MESSAGES, DEFAULT_PARAMS)
         assert payload["stream"] is True
         assert payload["model"] == "mistral-7b"
 
     def test_complete_payload(self):
-        payload = self.adapter._complete_payload(MESSAGES)
+        payload = self.adapter._complete_payload(MESSAGES, DEFAULT_PARAMS)
         assert payload["stream"] is False
+
+    def test_payload_forwards_max_tokens(self):
+        params = SamplingParams(max_tokens=256)
+        payload = self.adapter._stream_payload(MESSAGES, params)
+        assert payload["max_tokens"] == 256
+
+    def test_payload_forwards_temperature(self):
+        params = SamplingParams(temperature=0.0)
+        payload = self.adapter._complete_payload(MESSAGES, params)
+        assert payload["temperature"] == 0.0
+
+    def test_payload_omits_none_params(self):
+        payload = self.adapter._complete_payload(MESSAGES, DEFAULT_PARAMS)
+        assert "temperature" not in payload
+        assert "max_tokens" not in payload
 
     # ── SSE line parsing ──────────────────────────────────────────────────────
 
@@ -165,7 +202,6 @@ class TestOpenAIAdapter:
         assert done is True
 
     def test_parse_sse_null_content(self):
-        """First chunk from OpenAI often has content=null (role announcement)."""
         data = {"choices": [{"delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
         line = f"data: {json.dumps(data)}"
         token, done = self.adapter._parse_stream_line(line)
@@ -173,14 +209,12 @@ class TestOpenAIAdapter:
         assert done is False
 
     def test_parse_sse_no_data_prefix(self):
-        """Some proxies strip the 'data: ' prefix — should still parse."""
         data = {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]}
-        line = json.dumps(data)  # no "data: " prefix
+        line = json.dumps(data)
         token, done = self.adapter._parse_stream_line(line)
         assert token == "Hi"
 
     def test_parse_sse_empty_choices(self):
-        """Heartbeat/keepalive lines with empty choices should not crash."""
         data = {"choices": []}
         line = f"data: {json.dumps(data)}"
         token, done = self.adapter._parse_stream_line(line)
@@ -220,16 +254,10 @@ class TestOpenAIAdapter:
 # ── Real-world vLLM / LiteLLM SSE shapes ─────────────────────────────────────
 
 class TestOpenAIAdapterRealWorldLines:
-    """
-    Replay actual SSE lines observed from vLLM and LiteLLM to guard
-    against format drift.
-    """
-
     def setup_method(self):
         self.adapter = OpenAIAdapter(_settings(llm_backend="openai"))
 
     def test_vllm_first_chunk(self):
-        """vLLM emits role in the first delta, content starts empty."""
         line = 'data: {"id":"cmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}'
         token, done = self.adapter._parse_stream_line(line)
         assert token == ""
@@ -251,7 +279,6 @@ class TestOpenAIAdapterRealWorldLines:
         assert done is True
 
     def test_groq_content(self):
-        """Groq uses standard OpenAI SSE format."""
         line = 'data: {"id":"chatcmpl-xyz","choices":[{"delta":{"content":"Hello"},"finish_reason":null,"index":0}]}'
         token, done = self.adapter._parse_stream_line(line)
         assert token == "Hello"

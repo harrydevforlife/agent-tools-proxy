@@ -7,13 +7,16 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.core.adapters import get_adapter
 from app.routers.chat import router as chat_router
 from app.routers.models import router as models_router
+from app.routers.proxy import router as proxy_router
 
 logging.basicConfig(
     level=settings.log_level.upper(),
@@ -57,6 +60,37 @@ app.add_middleware(
 
 app.include_router(chat_router)
 app.include_router(models_router)
+app.include_router(proxy_router)  # catch-all — must be last
+
+
+# ── OpenAI-shaped error responses ─────────────────────────────────────────────
+
+@app.exception_handler(HTTPException)
+async def openai_http_exception_handler(_request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "message": exc.detail,
+                "type": "invalid_request_error" if exc.status_code < 500 else "server_error",
+                "code": exc.status_code,
+            }
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def openai_validation_exception_handler(_request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "message": str(exc),
+                "type": "invalid_request_error",
+                "code": "invalid_request",
+            }
+        },
+    )
 
 
 @app.get("/health")

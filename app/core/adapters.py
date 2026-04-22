@@ -41,6 +41,14 @@ from app.config import Settings
 
 
 @dataclass
+class SamplingParams:
+    """Optional sampling parameters forwarded from the client request."""
+    model: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
+@dataclass
 class CompleteResult:
     """Return value from BackendAdapter.complete()."""
     text: str
@@ -74,10 +82,10 @@ class BackendAdapter(ABC):
     def _complete_url(self) -> str: ...
 
     @abstractmethod
-    def _stream_payload(self, messages: list[dict]) -> dict: ...
+    def _stream_payload(self, messages: list[dict], params: SamplingParams) -> dict: ...
 
     @abstractmethod
-    def _complete_payload(self, messages: list[dict]) -> dict: ...
+    def _complete_payload(self, messages: list[dict], params: SamplingParams) -> dict: ...
 
     @abstractmethod
     def _parse_stream_line(self, line: str) -> tuple[str, bool]:
@@ -101,9 +109,10 @@ class BackendAdapter(ABC):
         self,
         client: httpx.AsyncClient,
         messages: list[dict],
+        params: SamplingParams | None = None,
     ) -> AsyncIterator[str]:
         """Yield raw text tokens from the backend's streaming response."""
-        payload = self._stream_payload(messages)
+        payload = self._stream_payload(messages, params or SamplingParams())
 
         async with client.stream(
             "POST",
@@ -141,9 +150,10 @@ class BackendAdapter(ABC):
         self,
         client: httpx.AsyncClient,
         messages: list[dict],
+        params: SamplingParams | None = None,
     ) -> CompleteResult:
         """Non-streaming: return the assistant text and usage stats."""
-        payload = self._complete_payload(messages)
+        payload = self._complete_payload(messages, params or SamplingParams())
 
         resp = await client.post(
             self._complete_url(),
@@ -180,19 +190,23 @@ class OllamaAdapter(BackendAdapter):
     def _complete_url(self) -> str:
         return self._base_url() + "/api/chat"
 
-    def _stream_payload(self, messages: list[dict]) -> dict:
-        return {
-            "model": self.settings.llm_model,
+    def _build_payload(self, messages: list[dict], params: SamplingParams, stream: bool) -> dict:
+        payload: dict = {
+            "model": params.model or self.settings.llm_model,
             "messages": messages,
-            "stream": True,
+            "stream": stream,
         }
+        if params.temperature is not None:
+            payload["temperature"] = params.temperature
+        if params.max_tokens is not None:
+            payload["num_predict"] = params.max_tokens
+        return payload
 
-    def _complete_payload(self, messages: list[dict]) -> dict:
-        return {
-            "model": self.settings.llm_model,
-            "messages": messages,
-            "stream": False,
-        }
+    def _stream_payload(self, messages: list[dict], params: SamplingParams) -> dict:
+        return self._build_payload(messages, params, stream=True)
+
+    def _complete_payload(self, messages: list[dict], params: SamplingParams) -> dict:
+        return self._build_payload(messages, params, stream=False)
 
     def _parse_stream_line(self, line: str) -> tuple[str, bool]:
         data = json.loads(line)
@@ -236,19 +250,23 @@ class OpenAIAdapter(BackendAdapter):
     def _complete_url(self) -> str:
         return self._base_url() + "/v1/chat/completions"
 
-    def _stream_payload(self, messages: list[dict]) -> dict:
-        return {
-            "model": self.settings.llm_model,
+    def _build_payload(self, messages: list[dict], params: SamplingParams, stream: bool) -> dict:
+        payload: dict = {
+            "model": params.model or self.settings.llm_model,
             "messages": messages,
-            "stream": True,
+            "stream": stream,
         }
+        if params.temperature is not None:
+            payload["temperature"] = params.temperature
+        if params.max_tokens is not None:
+            payload["max_tokens"] = params.max_tokens
+        return payload
 
-    def _complete_payload(self, messages: list[dict]) -> dict:
-        return {
-            "model": self.settings.llm_model,
-            "messages": messages,
-            "stream": False,
-        }
+    def _stream_payload(self, messages: list[dict], params: SamplingParams) -> dict:
+        return self._build_payload(messages, params, stream=True)
+
+    def _complete_payload(self, messages: list[dict], params: SamplingParams) -> dict:
+        return self._build_payload(messages, params, stream=False)
 
     def _parse_stream_line(self, line: str) -> tuple[str, bool]:
         # SSE lines start with "data: "
@@ -302,5 +320,5 @@ def get_adapter(settings: Settings) -> BackendAdapter:
             f"Unknown backend {settings.llm_backend!r}. "
             f"Valid options: {list(_ADAPTERS)}"
         )
-    log.info("Using backend adapter: %s → %s", settings.llm_backend, cls.__name__)
+    log.info("Using backend adapter: %s → %s with base url %s", settings.llm_backend, cls.__name__, settings.llm_base_url)
     return cls(settings)

@@ -18,9 +18,10 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from app.config import settings
-from app.core.adapters import BackendAdapter
+from app.core.adapters import BackendAdapter, SamplingParams
 from app.core.buffer import detect_tool_calls, parse_tool_call
 from app.core.formatter import (
+    StreamContext,
     content_chunk,
     content_stop_chunk,
     done_sentinel,
@@ -35,11 +36,56 @@ from app.models.openai import (
     Message,
     ToolCallFunction,
     ToolCallMessage,
+    ToolChoice,
+    ToolDef,
     Usage,
 )
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ── Tool choice resolution ────────────────────────────────────────────────────
+
+def _resolve_tools(
+    req: ChatCompletionRequest,
+) -> tuple[list[ToolDef] | None, str]:
+    """
+    Apply tool_choice logic. Returns (effective_tools, mode) where mode is
+    one of "none", "auto", "required", or "forced:<name>".
+    """
+    if not req.tools:
+        return None, "none"
+
+    tc = req.tool_choice
+
+    if tc == "none":
+        return None, "none"
+
+    if tc == "auto":
+        return req.tools, "auto"
+
+    if tc == "required":
+        return req.tools, "required"
+
+    if isinstance(tc, ToolChoice):
+        forced_name = tc.function.get("name", "")
+        matching = [t for t in req.tools if t.function.name == forced_name]
+        return (matching or req.tools), f"forced:{forced_name}"
+
+    return req.tools, "auto"
+
+
+def _sampling_params(req: ChatCompletionRequest) -> SamplingParams:
+    return SamplingParams(
+        model=req.model if req.model != "passthrough" else None,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+    )
+
+
+def _model_name() -> str:
+    return settings.llm_model
 
 
 # ── SSE generator ─────────────────────────────────────────────────────────────
@@ -51,29 +97,32 @@ async def _sse_generator(
 ) -> AsyncIterator[str]:
     """
     Main streaming generator — backend-agnostic.
-    Yields SSE-formatted strings consumed by EventSourceResponse.
+    Yields raw JSON strings consumed by EventSourceResponse.
     """
-    llm_messages = build_llm_messages(req.messages, req.tools)
-    token_stream = adapter.stream_tokens(client, llm_messages)
+    tools, mode = _resolve_tools(req)
+    llm_messages = build_llm_messages(req.messages, tools, tool_choice_mode=mode)
+    params = _sampling_params(req)
+    token_stream = adapter.stream_tokens(client, llm_messages, params)
 
+    ctx = StreamContext(model=_model_name())
     open_token = settings.tool_call_open_token
     emitted_role = False
 
     async for event_type, payload in detect_tool_calls(token_stream, open_token):
         if event_type == "content":
             if not emitted_role:
-                yield role_chunk()
+                yield role_chunk(ctx)
                 emitted_role = True
-            yield content_chunk(payload)  # type: ignore[arg-type]
+            yield content_chunk(payload, ctx)  # type: ignore[arg-type]
 
         elif event_type == "tool_call":
             parsed = parse_tool_call(payload)  # type: ignore[arg-type]
             if parsed is None:
                 log.warning("Failed to parse tool call JSON: %r", payload)
                 if not emitted_role:
-                    yield role_chunk()
-                yield content_chunk(payload)  # type: ignore[arg-type]
-                yield content_stop_chunk()
+                    yield role_chunk(ctx)
+                yield content_chunk(payload, ctx)  # type: ignore[arg-type]
+                yield content_stop_chunk(ctx)
                 yield done_sentinel()
                 return
 
@@ -81,17 +130,17 @@ async def _sse_generator(
             log.info("Tool call detected: %s(%s)", name, list(arguments.keys()))
 
             if not emitted_role:
-                yield role_chunk()
+                yield role_chunk(ctx)
 
-            for chunk in tool_call_chunks(name, arguments):
+            for chunk in tool_call_chunks(name, arguments, ctx):
                 yield chunk
 
             yield done_sentinel()
-            return  # stream ends — client sends tool result as new request
+            return
 
         elif event_type == "done":
             if emitted_role:
-                yield content_stop_chunk()
+                yield content_stop_chunk(ctx)
             yield done_sentinel()
 
 
@@ -102,7 +151,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> JSON
     client: httpx.AsyncClient = request.app.state.http_client
     adapter: BackendAdapter = request.app.state.adapter
 
-    # ── Streaming ─────────────────────────────────────────────────────────────
     if req.stream:
         return EventSourceResponse(
             _sse_generator(req, client, adapter),
@@ -110,9 +158,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> JSON
         )
 
     # ── Non-streaming ─────────────────────────────────────────────────────────
-    llm_messages = build_llm_messages(req.messages, req.tools)
-    result = await adapter.complete(client, llm_messages)
+    tools, mode = _resolve_tools(req)
+    llm_messages = build_llm_messages(req.messages, tools, tool_choice_mode=mode)
+    params = _sampling_params(req)
+    result = await adapter.complete(client, llm_messages, params)
 
+    model = _model_name()
     usage = Usage(**result.usage) if result.usage else None
 
     stripped = result.text.strip()
@@ -136,6 +187,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> JSON
                 ],
             )
             resp = ChatCompletionResponse(
+                model=model,
                 choices=[Choice(message=msg, finish_reason="tool_calls")],
                 usage=usage,
             )
@@ -143,6 +195,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> JSON
 
     msg = Message(role="assistant", content=result.text)
     resp = ChatCompletionResponse(
+        model=model,
         choices=[Choice(message=msg, finish_reason="stop")],
         usage=usage,
     )
